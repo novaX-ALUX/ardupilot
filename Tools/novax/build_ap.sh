@@ -34,6 +34,9 @@ if [[ -L "${BUILD_LINK}" ]]; then
 elif [[ ! -e "${BUILD_LINK}" ]]; then
     mkdir -p "${BUILD_LINK_DIR}"
     ln -s "${BUILD_REL}" "${BUILD_LINK}"
+else
+    echo "Refusing to overwrite non-symlink build path: ${BUILD_LINK}" >&2
+    exit 1
 fi
 
 cd "${AP_ROOT}"
