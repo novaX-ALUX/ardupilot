@@ -17,7 +17,9 @@ For a **new, empty destination only**, clone the branch, then checkout the exact
 git clone --branch novax-workspace https://github.com/novaX-ALUX/ardupilot.git _shared/ardupilot
 # In a fresh checkout, select the product lock-file commit before this step:
 git -C _shared/ardupilot submodule update --init --recursive
+bash fc/scripts/apply_ap_patches.sh
 bash fc/scripts/build_ap.sh AF-F4_nano copter
+bash gnss/scripts/apply_ap_patches.sh
 bash gnss/scripts/build_ap.sh AP-RTK_G5H AP_Periph
 ```
 
