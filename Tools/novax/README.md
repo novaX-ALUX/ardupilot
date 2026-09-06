@@ -17,12 +17,15 @@ For a **new, empty destination only**, clone the branch, then checkout the exact
 git clone --branch novax-workspace https://github.com/novaX-ALUX/ardupilot.git _shared/ardupilot
 # In a fresh checkout, select the product lock-file commit before this step:
 git -C _shared/ardupilot submodule update --init --recursive
+bash _shared/ardupilot/Tools/novax/install_toolchain.sh
 bash fc/scripts/apply_ap_patches.sh
 bash fc/scripts/build_ap.sh AF-F4_nano copter
 bash gnss/scripts/apply_ap_patches.sh
 bash gnss/scripts/build_ap.sh AP-RTK_G5H AP_Periph
 ```
 
-Linux/WSL, Python 3, the upstream Python dependencies, ARM GCC and `flock` are required. `NOVAX_AP_ROOT` selects a different prepared checkout. `NOVAX_AP_BUILD_DIR` selects an isolated build output. Builds serialize access to this shared tree. Board versions remain independent; GNSS always uses `AP_Periph`.
+Linux/WSL, Python 3, the upstream Python dependencies, **ARM GCC 10.2.1 (10-2020-q4-major)** and `flock` are required. This matches [upstream compiler setup](https://ardupilot.org/dev/docs/building-setup-linux.html) and the pinned `Tools/environment_install/install-prereqs-ubuntu.sh`. The installer uses the upstream HTTPS mirror and checks SHA-256; its user cache does not change the system compiler. `NOVAX_AP_SDK_ROOT` selects an existing 10.2.1 SDK. Other GCC versions fail closed instead of silently changing the build environment. This compiler is independent of Betaflight's pinned SDK.
 
-Read-only regression: `python3 Tools/novax/test_paths.py`. Release approval, signing, hardware qualification and publishing remain separate gates.
+`NOVAX_AP_ROOT` selects a different prepared checkout. `NOVAX_AP_BUILD_DIR` selects an isolated build output. Builds serialize access to this shared tree. Board versions remain independent; GNSS always uses `AP_Periph`.
+
+Read-only regression: `python3 Tools/novax/test_paths.py` and `python3 Tools/novax/test_build_guards.py`. The latter checks family-specific F4/F7 DFU backup registers and rejects a bootloader helper that reports success without producing an image. Recursive submodules (including `CrashDebug/CrashCatcher`) are required by H7/F7 builds. Release approval, signing, hardware qualification and publishing remain separate gates.

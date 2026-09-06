@@ -37,6 +37,7 @@ elif [[ ! -e "${BUILD_LINK}" ]]; then
 fi
 
 cd "${AP_ROOT}"
+source "${ENGINE_DIR}/toolchain.sh"
 
 # Build bootloader first if it doesn't exist (required for boards with custom Board ID)
 BL_BIN="${AP_ROOT}/Tools/bootloaders/${BOARD_NAME}_bl.bin"
@@ -44,6 +45,8 @@ if [[ ! -f "${BL_BIN}" ]]; then
     echo "Bootloader not found, building: ${BL_BIN}"
     python3 Tools/scripts/build_bootloaders.py "${BOARD_NAME}"
 fi
+# The upstream helper can print "Failed boards" but return success.
+[[ -s "${BL_BIN}" ]] || { echo "Bootloader build produced no image: ${BL_BIN}" >&2; exit 1; }
 
 # --- novaX custom firmware version string (shown in GCS) ---------------------
 # Inject AP_CUSTOM_FIRMWARE_STRING through --extra-hwdef so each board carries

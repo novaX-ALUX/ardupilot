@@ -1,0 +1,19 @@
+name: novaX product build tools
+on:
+  push:
+    branches: [novax-workspace]
+    paths: ['Tools/novax/**', '.github/workflows/novax-tools.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  product-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 Tools/novax/test_paths.py
+      - run: python3 Tools/novax/test_build_guards.py
+      - name: Apply committed patches and verify idempotence
+        run: |
+          bash Tools/novax/apply_patches.sh
+          bash Tools/novax/apply_patches.sh --check

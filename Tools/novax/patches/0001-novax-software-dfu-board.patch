@@ -87,10 +87,10 @@ index 1012216b02..ba09d58434 100644
  #endif
  
 diff --git a/libraries/AP_HAL_ChibiOS/hwdef/common/board.c b/libraries/AP_HAL_ChibiOS/hwdef/common/board.c
-index 618fe597ac..170b1d53aa 100644
+index 618fe597ac..bc1407330c 100644
 --- a/libraries/AP_HAL_ChibiOS/hwdef/common/board.c
 +++ b/libraries/AP_HAL_ChibiOS/hwdef/common/board.c
-@@ -234,6 +234,78 @@ static void stm32_gpio_init(void) {
+@@ -234,6 +234,82 @@ static void stm32_gpio_init(void) {
   * You can rely on: 1) const variables or tables 2) flash code 3) automatic variables
   */
  void __early_init(void) {
@@ -131,7 +131,11 @@ index 618fe597ac..170b1d53aa 100644
 +             (the clear below) silently fails without them — so boot_to_dfu never clears and
 +             the board re-enters DFU on every boot (stuck loop). Enable PWR clock + DBP here. */
 +          RCC->APB1ENR |= RCC_APB1ENR_PWREN; (void)RCC->APB1ENR;
++#if defined(STM32F7)
++          PWR->CR1 |= PWR_CR1_DBP;
++#else
 +          PWR->CR |= PWR_CR_DBP;
++#endif
 +#endif
 +          pd.boot_to_dfu = 0;
 +          stm32_watchdog_save((uint32_t *)&pd, (sizeof(pd)+3)/4);
@@ -278,4 +282,3 @@ index dfac4b8031..4107fb5a28 100644
  #endif
  #ifndef HAL_BOOTLOADER_BUILD
  bool stm32_flash_recent_erase(void);
-
