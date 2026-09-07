@@ -1,0 +1,438 @@
+diff --git a/libraries/AP_GPS/AP_GPS_UBLOX.cpp b/libraries/AP_GPS/AP_GPS_UBLOX.cpp
+index ac89ca2ebe..b34129689f 100644
+--- a/libraries/AP_GPS/AP_GPS_UBLOX.cpp
++++ b/libraries/AP_GPS/AP_GPS_UBLOX.cpp
+@@ -105,8 +105,14 @@ AP_GPS_UBLOX::AP_GPS_UBLOX(AP_GPS &_gps,
+     // stop any config strings that are pending
+     gps.send_blob_start(state.instance, nullptr, 0);
+
++    // X20 receivers do not enable periodic UBX output at the factory.  Identify
++    // them before sending any of the legacy CFG polls they do not implement.
++#if AP_GPS_UBLOX_X20_ENABLED
++    _request_version();
++#else
+     // start the process of updating the GPS rates
+     _request_next_config();
++#endif
+
+ #if CONFIGURE_PPS_PIN
+     _unconfigured_messages |= CONFIG_TP5;
+@@ -267,6 +296,29 @@ const AP_GPS_UBLOX::config_list AP_GPS_UBLOX::config_L5_ovrd_dis[] {
+     {ConfigKey::CFG_SIGNAL_L5_HEALTH_OVRD, 0},
+ };
+
++#if AP_GPS_UBLOX_X20_ENABLED
++/*
++  ZED-X20D HDG 2.00 UART1 configuration.  Keep the baud-rate item last:
++  the init blob has already moved the receiver to 230400, so it should only
++  ever verify as a no-op and cannot cut the active link before the other keys
++  have been checked.
++ */
++const AP_GPS_UBLOX::config_list AP_GPS_UBLOX::config_X20[] {
++    {ConfigKey::CFG_RATE_MEAS,                  200},
++    {ConfigKey::CFG_RATE_NAV,                   1},
++    {ConfigKey::CFG_UART1_ENABLED,              1},
++    {ConfigKey::CFG_UART1INPROT_UBX,            1},
++    {ConfigKey::CFG_UART1OUTPROT_UBX,           1},
++    {ConfigKey::CFG_UART1OUTPROT_NMEA,          0},
++    {ConfigKey::MSGOUT_UBX_NAV_PVT_UART1,       1},
++    {ConfigKey::MSGOUT_UBX_NAV_DOP_UART1,       1},
++    {ConfigKey::MSGOUT_UBX_NAV_TIMEGPS_UART1,   RATE_TIMEGPS},
++    {ConfigKey::MSGOUT_UBX_NAV_DAHEADING_UART1, 1},
++    {ConfigKey::CFG_NAVSPG_DAHEADING_OFFSET,    0},
++    {ConfigKey::CFG_UART1_BAUDRATE,             230400},
++};
++#endif
++
+ void
+ AP_GPS_UBLOX::_request_next_config(void)
+ {
+@@ -281,6 +333,35 @@ AP_GPS_UBLOX::_request_next_config(void)
+         return;
+     }
+
++#if AP_GPS_UBLOX_X20_ENABLED
++    if (_hardware_generation == UBLOX_X20) {
++        if ((_unconfigured_messages & CONFIG_X20) == 0 || _x20_config_failed) {
++            return;
++        }
++
++        const uint32_t now = AP_HAL::millis();
++        if (now - _x20_config_time < 1000U) {
++            return;
++        }
++        if (_x20_config_attempts >= 20) {
++            _x20_config_failed = true;
++            GCS_SEND_TEXT(MAV_SEVERITY_ERROR,
++                          "GPS %u: X20 configuration failed 0x%02x",
++                          unsigned(state.instance + 1),
++                          unsigned(_unconfigured_messages));
++            return;
++        }
++
++        static_assert(sizeof(active_config.done_mask) * 8 >= ARRAY_SIZE(config_X20),
++                      "X20 config done_mask too small");
++        _x20_config_time = now;
++        _x20_config_attempts++;
++        _configure_config_set(config_X20, ARRAY_SIZE(config_X20), CONFIG_X20,
++                              UBX_VALSET_LAYER_RAM | UBX_VALSET_LAYER_BBR);
++        return;
++    }
++#endif
++
+     if ((_unconfigured_messages & CONFIG_RATE_SOL) != 0 && havePvtMsg) {
+         /*
+           we don't need SOL if we have PVT and TIMEGPS. This is needed
+@@ -1126,6 +1207,20 @@ AP_GPS_UBLOX::_parse_gps(void)
+                     if (active_config.list != nullptr) {
+                         CFG_Debug("NACK VALSET 0x%x 0x%x", (unsigned)_buffer.nack.msgID,
+                                   unsigned(active_config.list[active_config.set_index].key));
++#if AP_GPS_UBLOX_X20_ENABLED
++                        if (_hardware_generation == UBLOX_X20 &&
++                            active_config.unconfig_bit == CONFIG_X20 &&
++                            ++_x20_valset_nacks >= 3) {
++                            // Stop bounded X20 retries without clearing the
++                            // error bit: the node remains non-armable instead
++                            // of hiding a missing heading configuration.
++                            _x20_config_failed = true;
++                            GCS_SEND_TEXT(MAV_SEVERITY_ERROR,
++                                          "GPS %u: X20 rejected key 0x%08x",
++                                          unsigned(state.instance + 1),
++                                          unsigned(active_config.list[active_config.set_index].key));
++                        }
++#endif
+                         if (is_gnss_key(active_config.list[active_config.set_index].key)) {
+                             GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "GPS %u: unable to configure band 0x%02x",
+                                           unsigned(state.instance + 1), unsigned(active_config.list[active_config.set_index].key));
+@@ -1470,6 +1565,27 @@ AP_GPS_UBLOX::_parse_gps(void)
+                     _unconfigured_messages |= CONFIG_L5;
+                 }
+             }
++#if AP_GPS_UBLOX_X20_ENABLED
++            const bool x20_hdg =
++                memmem(_buffer.mon_ver.extension, sizeof(_buffer.mon_ver.extension),
++                       "FWVER=HDG", 9) != nullptr &&
++                memmem(_buffer.mon_ver.extension, sizeof(_buffer.mon_ver.extension),
++                       "MOD=ZED-X20D", 12) != nullptr;
++            if (x20_hdg) {
++                _hardware_generation = UBLOX_X20;
++                // X20 uses only the key/value configuration database.  Drop
++                // every legacy CFG status bit so AP_Periph armability depends
++                // solely on successful validation of the X20 configuration.
++                _unconfigured_messages = CONFIG_X20;
++                _x20_config_time = 0;
++                _x20_config_attempts = 0;
++                _x20_valset_nacks = 0;
++                _x20_config_failed = false;
++                state.gps_yaw_configured = true;
++                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "GPS %u: ZED-X20D HDG detected",
++                              unsigned(state.instance + 1));
++            }
++#endif
+             break;
+         }
+         default:
+@@ -1616,6 +1732,36 @@ AP_GPS_UBLOX::_parse_gps(void)
+ #endif
+         break;
+
++#if AP_GPS_UBLOX_X20_ENABLED
++    case MSG_DAHEADING: {
++        if (_hardware_generation != UBLOX_X20 ||
++            _payload_length != sizeof(ubx_nav_daheading) ||
++            _buffer.daheading.version != 2) {
++            state.have_gps_yaw = false;
++            state.have_gps_yaw_accuracy = false;
++            break;
++        }
++
++        _check_new_itow(_buffer.daheading.iTOW);
++        _last_daheading_itow = _buffer.daheading.iTOW;
++        const uint32_t heading_valid =
++            static_cast<uint32_t>(DAHEADING::relPosHeadingValid);
++        if ((_buffer.daheading.flags & heading_valid) != 0) {
++            const uint32_t now = AP_HAL::millis();
++            state.gps_yaw = wrap_360(_buffer.daheading.relPosHeading * 1.0e-5f);
++            state.gps_yaw_accuracy = _buffer.daheading.accHeading * 1.0e-5f;
++            state.have_gps_yaw = true;
++            state.have_gps_yaw_accuracy = true;
++            state.gps_yaw_time_ms = now;
++            _last_daheading_ms = now;
++        } else {
++            state.have_gps_yaw = false;
++            state.have_gps_yaw_accuracy = false;
++        }
++        break;
++    }
++#endif
++
+ #if GPS_MOVING_BASELINE
+     case MSG_RELPOSNED:
+         {
+@@ -1826,6 +1972,20 @@ AP_GPS_UBLOX::_parse_gps(void)
+     }
+
+     if (state.have_gps_yaw) {
++#if AP_GPS_UBLOX_X20_ENABLED
++        if (_hardware_generation == UBLOX_X20) {
++            // Publish a position/velocity sample only when its heading belongs
++            // to the same navigation epoch, and never retain heading for more
++            // than two 5 Hz epochs.
++            if (AP_HAL::millis() - _last_daheading_ms > 400U) {
++                state.have_gps_yaw = false;
++                state.have_gps_yaw_accuracy = false;
++            } else if (_last_daheading_itow != _last_pvt_itow) {
++                return false;
++            }
++        } else
++#endif
++        {
+         // when we are a rover we want to ensure we have both the new
+         // PVT and the new RELPOSNED message so that we give a
+         // consistent view
+@@ -1836,6 +1996,7 @@ AP_GPS_UBLOX::_parse_gps(void)
+             // wait until ITOW matches
+             return false;
+         }
++        }
+     }
+
+     // we only return true when we get new position and speed data
+@@ -1954,7 +2115,7 @@ AP_GPS_UBLOX::_configure_message_rate(uint8_t msg_class, uint8_t msg_id, uint8_t
+ bool
+ AP_GPS_UBLOX::_configure_valset(ConfigKey key, const void *value, uint8_t layers)
+ {
+-    if (!supports_F9_config()) {
++    if (!supports_val_config()) {
+         return false;
+     }
+
+@@ -1980,7 +2141,7 @@ AP_GPS_UBLOX::_configure_valset(ConfigKey key, const void *value, uint8_t layers
+ bool
+ AP_GPS_UBLOX::_configure_valget(ConfigKey key)
+ {
+-    if (!supports_F9_config()) {
++    if (!supports_val_config()) {
+         return false;
+     }
+     struct {
+@@ -2043,7 +2204,7 @@ AP_GPS_UBLOX::_configure_config_set(const config_list *list, uint8_t count, uint
+ bool
+ AP_GPS_UBLOX::_configure_list_valset(const config_list *list, uint8_t count, uint8_t layers)
+ {
+-    if (!supports_F9_config()) {
++    if (!supports_val_config()) {
+         return false;
+     }
+
+@@ -2129,6 +2290,7 @@ reset:
+         case 5:
+             state.step++;
+             state.ck_b += (state.ck_a += data);
++            state.payload_length += uint16_t(data) << 8;
+             state.payload_counter = 0;
+             break;
+         case 6:
+@@ -2193,7 +2355,8 @@ static const char *reasons[] = {"navigation rate",
+                                 "TIM TM2",
+                                 "F9",
+                                 "M10",
+-                                "L5 Enable Disable"};
++                                "L5 Enable Disable",
++                                "X20"};
+
+ static_assert((1 << ARRAY_SIZE(reasons)) == CONFIG_LAST, "UBLOX: Missing configuration description");
+
+@@ -2405,6 +2568,12 @@ bool AP_GPS_UBLOX::supports_F9_config(void) const
+     return _hardware_generation == UBLOX_F9 || _hardware_generation == UBLOX_M10;
+ }
+
++// return true if the receiver supports CFG-VALGET/CFG-VALSET
++bool AP_GPS_UBLOX::supports_val_config(void) const
++{
++    return supports_F9_config() || _hardware_generation == UBLOX_X20;
++}
++
+ // return true if GPS is capable of F9 config
+ bool AP_GPS_UBLOX::is_gnss_key(ConfigKey key) const
+ {
+diff --git a/libraries/AP_GPS/AP_GPS_UBLOX.h b/libraries/AP_GPS/AP_GPS_UBLOX.h
+index 47d1ccbd3f..3f89c02c6b 100644
+--- a/libraries/AP_GPS/AP_GPS_UBLOX.h
++++ b/libraries/AP_GPS/AP_GPS_UBLOX.h
+@@ -50,7 +50,20 @@
+ #define UBLOX_SET_BINARY_115200 "\265\142\006\001\003\000\001\006\001\022\117$PUBX,41,1,0023,0001,115200,0*1C\r\n"
+
+ // a variant with 230400 baudrate
+-#define UBLOX_SET_BINARY_230400 "\265\142\006\001\003\000\001\006\001\022\117$PUBX,41,1,0023,0001,230400,0*1E\r\n"
++#ifndef AP_GPS_UBLOX_X20_ENABLED
++#define AP_GPS_UBLOX_X20_ENABLED 0
++#endif
++
++// ZED-X20D starts with periodic UBX output disabled.  Poll MON-VER before the
++// baud/protocol command so detection does not depend on a legacy CFG-MSG NACK,
++// and no input follows a baud change without the receiver's required delay.
++#if AP_GPS_UBLOX_X20_ENABLED
++#define UBLOX_X20_MON_VER_POLL "\265\142\012\004\000\000\016\064"
++#else
++#define UBLOX_X20_MON_VER_POLL ""
++#endif
++
++#define UBLOX_SET_BINARY_230400 UBLOX_X20_MON_VER_POLL "\265\142\006\001\003\000\001\006\001\022\117$PUBX,41,1,0023,0001,230400,0*1E\r\n"
+
+ // a variant with 460800 baudrate
+ #define UBLOX_SET_BINARY_460800 "\265\142\006\001\003\000\001\006\001\022\117$PUBX,41,1,0023,0001,460800,0*11\r\n"
+@@ -104,7 +117,8 @@
+ #define CONFIG_F9            (1<<19)
+ #define CONFIG_M10           (1<<20)
+ #define CONFIG_L5            (1<<21)
+-#define CONFIG_LAST          (1<<22) // this must always be the last bit
++#define CONFIG_X20           (1<<22)
++#define CONFIG_LAST          (1<<23) // this must always be the last bit
+
+ #define CONFIG_REQUIRED_INITIAL (CONFIG_RATE_NAV | CONFIG_RATE_POSLLH | CONFIG_RATE_STATUS | CONFIG_RATE_VELNED)
+
+@@ -259,6 +273,7 @@ private:
+     enum class ConfigKey : uint32_t {
+         TMODE_MODE = 0x20030001,
+         CFG_RATE_MEAS                   = 0x30210001,
++        CFG_RATE_NAV                    = 0x30210002,
+
+         CFG_UART1_BAUDRATE              = 0x40520001,
+         CFG_UART1_ENABLED               = 0x10520005,
+@@ -286,6 +301,10 @@ private:
+         MSGOUT_RTCM_3X_TYPE1127_UART1   = 0x209102d7,
+         MSGOUT_RTCM_3X_TYPE1230_UART1   = 0x20910304,
+         MSGOUT_UBX_NAV_RELPOSNED_UART1  = 0x2091008e,
++        MSGOUT_UBX_NAV_PVT_UART1        = 0x20910007,
++        MSGOUT_UBX_NAV_DOP_UART1        = 0x20910039,
++        MSGOUT_UBX_NAV_TIMEGPS_UART1    = 0x20910048,
++        MSGOUT_UBX_NAV_DAHEADING_UART1  = 0x209103e0,
+
+         MSGOUT_RTCM_3X_TYPE4072_0_UART2 = 0x20910300,
+         MSGOUT_RTCM_3X_TYPE4072_1_UART2 = 0x20910383,
+@@ -327,7 +346,8 @@ private:
+
+         // other keys
+         CFG_NAVSPG_DYNMODEL             = 0x20110021,
++        CFG_NAVSPG_DAHEADING_OFFSET     = 0x401100e4,
+         CFG_HW_RF_LNA_MODE              = 0x20a30057,
+
+     };
+
+@@ -445,6 +466,27 @@ private:
+         uint32_t flags;
+     };
+
++    // UBX-NAV-DAHEADING, production HDG 2.00 message version 2.
++    struct PACKED ubx_nav_daheading {
++        uint8_t version;
++        uint8_t reserved1[3];
++        uint32_t iTOW;
++        int32_t relPosN;
++        int32_t relPosE;
++        int32_t relPosD;
++        int32_t relPosLength;
++        int32_t relPosHeading;
++        uint8_t reserved2[4];
++        uint32_t accN;
++        uint32_t accE;
++        uint32_t accD;
++        uint32_t accLength;
++        uint32_t accHeading;
++        uint8_t reserved3[4];
++        uint32_t flags;
++    };
++    static_assert(sizeof(ubx_nav_daheading) == 60, "UBX-NAV-DAHEADING v2 payload size");
++
+     struct PACKED ubx_nav_velned {
+         uint32_t itow;                                  // GPS msToW
+         int32_t ned_north;
+@@ -627,6 +669,7 @@ private:
+         ubx_cfg_valget valget;
+         ubx_nav_svinfo_header svinfo_header;
+         ubx_nav_relposned relposned;
++        ubx_nav_daheading daheading;
+ #if UBLOX_RXM_RAW_LOGGING
+         ubx_rxm_raw rxm_raw;
+         ubx_rxm_rawx rxm_rawx;
+@@ -651,6 +694,15 @@ private:
+         relPosNormalized   = 1U << 9
+     };
+
++    enum class DAHEADING {
++        gnssFixOK          = 1U << 0,
++        diffSoln           = 1U << 1,
++        relPosValid        = 1U << 2,
++        carrSolnFloat      = 1U << 3,
++        carrSolnFixed      = 1U << 4,
++        relPosHeadingValid = 1U << 6
++    };
++
+     enum ubs_protocol_bytes {
+         PREAMBLE1 = 0xb5,
+         PREAMBLE2 = 0x62,
+@@ -669,6 +721,7 @@ private:
+         MSG_PVT = 0x7,
+         MSG_TIMEGPS = 0x20,
+         MSG_RELPOSNED = 0x3c,
++        MSG_DAHEADING = 0x45,
+         MSG_VELNED = 0x12,
+         MSG_CFG_CFG = 0x09,
+         MSG_CFG_RATE = 0x08,
+@@ -718,6 +771,7 @@ private:
+         UBLOX_F9 = 0x80, // comes from MON_VER hwVersion/swVersion strings
+         UBLOX_M9 = 0x81, // comes from MON_VER hwVersion/swVersion strings
+         UBLOX_M10 = 0x82,
++        UBLOX_X20 = 0x84,
+         UBLOX_UNKNOWN_HARDWARE_GENERATION = 0xff // not in the ublox spec used for
+                                                  // flagging state in the driver
+     };
+@@ -789,6 +843,14 @@ private:
+     uint32_t        _last_pvt_itow;
+     uint32_t        _last_relposned_itow;
+     uint32_t        _last_relposned_ms;
++#if AP_GPS_UBLOX_X20_ENABLED
++    uint32_t        _last_daheading_itow;
++    uint32_t        _last_daheading_ms;
++    uint32_t        _x20_config_time;
++    uint8_t         _x20_config_attempts;
++    uint8_t         _x20_valset_nacks;
++    bool            _x20_config_failed;
++#endif
+
+     // the role set from GPS_TYPE
+     AP_GPS::GPS_Role role;
+@@ -864,6 +926,9 @@ private:
+     // return true if GPS is capable of F9 config
+     bool supports_F9_config(void) const;
+
++    // return true if GPS supports the key/value configuration database
++    bool supports_val_config(void) const;
++
+     // is the config key a GNSS key
+     bool is_gnss_key(ConfigKey key) const;
+
+@@ -906,6 +971,9 @@ private:
+     static const config_list config_M10[];
+     static const config_list config_L5_ovrd_ena[];
+     static const config_list config_L5_ovrd_dis[];
++#if AP_GPS_UBLOX_X20_ENABLED
++    static const config_list config_X20[];
++#endif
+     // scratch space for GNSS config
+     config_list* config_GNSS;
+ };
+diff --git a/libraries/AP_GPS/GPS_detect_state.h b/libraries/AP_GPS/GPS_detect_state.h
+index bdc5d34e05..6c4cce698f 100644
+--- a/libraries/AP_GPS/GPS_detect_state.h
++++ b/libraries/AP_GPS/GPS_detect_state.h
+@@ -43,7 +43,7 @@ struct SIRF_detect_state {
+
+ #if AP_GPS_UBLOX_ENABLED
+ struct UBLOX_detect_state {
+-    uint8_t payload_length, payload_counter;
++    uint16_t payload_length, payload_counter;
+     uint8_t step;
+     uint8_t ck_a, ck_b;
+ };
